@@ -1,0 +1,19 @@
+{
+  "name": "vagazaps-whatsapp",
+  "version": "1.0.0",
+  "description": "WhatsApp backend for VagaZaps using Baileys",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
