@@ -114,12 +114,12 @@ async function connectWhatsApp() {
 }
 
 async function ensureConnected() {
-  if (connectionStatus === 'connected' && sock && sock.ws && sock.ws.readyState === 1) {
+  if (connectionStatus === 'connected' && sock) {
     return true
   }
   if (connectionStatus !== 'connected') {
     await connectWhatsApp()
-    await new Promise(r => setTimeout(r, 3000))
+    await new Promise(r => setTimeout(r, 5000))
     return connectionStatus === 'connected'
   }
   return false
