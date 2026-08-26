@@ -1,7 +1,6 @@
 const express = require('express')
 const cors = require('cors')
 const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys')
-const qrcode = require('qrcode-terminal')
 const path = require('path')
 const fs = require('fs')
 
@@ -17,6 +16,8 @@ let qrCode = null
 let connectionStatus = 'disconnected'
 let connectedPhone = null
 let messageQueue = []
+let lastActivity = Date.now()
+let keepaliveInterval = null
 
 async function connectWhatsApp() {
   try {
@@ -31,9 +32,23 @@ async function connectWhatsApp() {
       version,
       auth: state,
       printQRInTerminal: true,
-      browser: ['VagaZaps', 'Safari', '3.0'],
+      browser: ['VagaZaps', 'Chrome', '4.0'],
       markOnlineOnConnect: false,
+      connectTimeout: 30000,
+      keepAliveInterval: 25000,
     })
+
+    if (keepaliveInterval) clearInterval(keepaliveInterval)
+    keepaliveInterval = setInterval(() => {
+      if (sock && sock.ws && sock.ws.readyState === 1) {
+        sock.ws.ping()
+        console.log('[WhatsApp] Keepalive ping sent')
+      } else if (connectionStatus === 'connected') {
+        console.log('[WhatsApp] WebSocket dead but status=connected, reconnecting...')
+        connectionStatus = 'disconnected'
+        setTimeout(connectWhatsApp, 3000)
+      }
+    }, 30000)
 
     sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update
@@ -68,6 +83,7 @@ async function connectWhatsApp() {
         connectionStatus = 'connected'
         qrCode = null
         connectedPhone = sock.user?.id?.replace(/:.*@/, '@').split('@')[0] || null
+        lastActivity = Date.now()
         console.log(`[WhatsApp] Connected! Phone: ${connectedPhone}`)
       }
     })
@@ -75,9 +91,19 @@ async function connectWhatsApp() {
     sock.ev.on('creds.update', saveCreds)
 
     sock.ev.on('messages.upsert', ({ messages }) => {
+      lastActivity = Date.now()
       for (const msg of messages) {
         if (!msg.key.fromMe && msg.message) {
           console.log(`[WhatsApp] Message from ${msg.key.remoteJid}: ${msg.message.conversation || msg.message.extendedTextMessage?.text || '[media]'}`)
+        }
+      }
+    })
+
+    sock.ev.on('messages.update', (updates) => {
+      for (const update of updates) {
+        if (update.update?.status) {
+          const status = update.update.status
+          console.log(`[WhatsApp] Message status: ${update.key.id} -> ${status}`)
         }
       }
     })
@@ -88,11 +114,18 @@ async function connectWhatsApp() {
   }
 }
 
+function isSocketAlive() {
+  return sock && sock.ws && sock.ws.readyState === 1
+}
+
 app.get('/api/status', (req, res) => {
   res.json({
     status: connectionStatus,
     phone: connectedPhone,
     hasQr: !!qrCode,
+    alive: isSocketAlive(),
+    lastActivity: new Date(lastActivity).toISOString(),
+    uptime: Math.floor(process.uptime()),
   })
 })
 
@@ -104,7 +137,7 @@ app.get('/api/qr', (req, res) => {
 })
 
 app.post('/api/connect', async (req, res) => {
-  if (connectionStatus === 'connected') {
+  if (connectionStatus === 'connected' && isSocketAlive()) {
     return res.json({ success: true, message: 'Already connected', phone: connectedPhone })
   }
 
@@ -113,8 +146,25 @@ app.post('/api/connect', async (req, res) => {
   }
 
   try {
+    connectionStatus = 'disconnected'
     await connectWhatsApp()
     res.json({ success: true, message: 'Connection initiated', status: connectionStatus })
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message })
+  }
+})
+
+app.post('/api/reconnect', async (req, res) => {
+  try {
+    if (sock) {
+      sock.end()
+      sock = null
+    }
+    connectionStatus = 'disconnected'
+    qrCode = null
+    connectedPhone = null
+    await connectWhatsApp()
+    res.json({ success: true, message: 'Reconnecting...', status: connectionStatus })
   } catch (error) {
     res.status(500).json({ success: false, error: error.message })
   }
@@ -125,6 +175,13 @@ app.post('/api/send', async (req, res) => {
     return res.status(400).json({ success: false, error: 'WhatsApp not connected' })
   }
 
+  if (!isSocketAlive()) {
+    console.log('[WhatsApp] Socket dead, attempting reconnect...')
+    connectionStatus = 'disconnected'
+    connectWhatsApp()
+    return res.status(400).json({ success: false, error: 'Connection stale, reconnecting...' })
+  }
+
   const { phone, message } = req.body
 
   if (!phone || !message) {
@@ -133,8 +190,10 @@ app.post('/api/send', async (req, res) => {
 
   try {
     const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net'
+    console.log(`[WhatsApp] Sending to ${jid}...`)
     const result = await sock.sendMessage(jid, { text: message })
-    console.log(`[WhatsApp] Message sent to ${phone}`)
+    lastActivity = Date.now()
+    console.log(`[WhatsApp] Message sent to ${phone}, id: ${result.key.id}`)
 
     messageQueue.push({
       to: phone,
@@ -145,14 +204,18 @@ app.post('/api/send', async (req, res) => {
 
     res.json({ success: true, messageId: result.key.id })
   } catch (error) {
-    console.error('[WhatsApp] Send error:', error)
-    res.status(500).json({ success: false, error: error.message })
+    console.error('[WhatsApp] Send error:', error.message || error)
+    res.status(500).json({ success: false, error: error.message || String(error) })
   }
 })
 
 app.post('/api/send-batch', async (req, res) => {
   if (connectionStatus !== 'connected' || !sock) {
     return res.status(400).json({ success: false, error: 'WhatsApp not connected' })
+  }
+
+  if (!isSocketAlive()) {
+    return res.status(400).json({ success: false, error: 'Connection stale' })
   }
 
   const { messages } = req.body
@@ -168,6 +231,7 @@ app.post('/api/send-batch', async (req, res) => {
       const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net'
       const result = await sock.sendMessage(jid, { text: message })
       results.push({ phone, success: true, messageId: result.key.id })
+      lastActivity = Date.now()
 
       await new Promise(resolve => setTimeout(resolve, 1000 + Math.random() * 2000))
     } catch (error) {
@@ -180,6 +244,7 @@ app.post('/api/send-batch', async (req, res) => {
 
 app.post('/api/disconnect', async (req, res) => {
   try {
+    if (keepaliveInterval) clearInterval(keepaliveInterval)
     if (sock) {
       sock.end()
       sock = null
@@ -198,7 +263,7 @@ app.get('/api/history', (req, res) => {
 })
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, uptime: process.uptime() })
+  res.json({ ok: true, uptime: process.uptime(), status: connectionStatus, alive: isSocketAlive() })
 })
 
 connectWhatsApp()
