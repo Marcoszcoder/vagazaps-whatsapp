@@ -9,7 +9,7 @@ app.use(cors())
 app.use(express.json())
 
 const PORT = process.env.PORT || 3001
-const AUTH_DIR = path.join(__dirname, 'auth_state')
+const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_state')
 
 let sock = null
 let qrCode = null
