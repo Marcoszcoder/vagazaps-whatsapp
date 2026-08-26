@@ -117,9 +117,13 @@ async function ensureConnected() {
   if (connectionStatus === 'connected' && sock) {
     return true
   }
+  if (connectionStatus === 'connected' && !sock) {
+    connectionStatus = 'disconnected'
+    reconnecting = false
+  }
   if (connectionStatus !== 'connected') {
     await connectWhatsApp()
-    await new Promise(r => setTimeout(r, 5000))
+    await new Promise(r => setTimeout(r, 8000))
     return connectionStatus === 'connected'
   }
   return false
@@ -156,8 +160,11 @@ app.post('/api/send', async (req, res) => {
     return res.status(400).json({ success: false, error: 'phone and message required' })
   }
 
+  console.log(`[WhatsApp] Send request for ${phone}. Status: ${connectionStatus}, sock: ${!!sock}`)
+
   const connected = await ensureConnected()
   if (!connected) {
+    console.log(`[WhatsApp] Send failed: not connected after ensureConnected. Status: ${connectionStatus}`)
     return res.status(400).json({ success: false, error: 'WhatsApp nao conectado. Escaneie o QR code.' })
   }
 
