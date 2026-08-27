@@ -20,22 +20,15 @@ let reconnectTimer = null
 
 function normalizePhone(phone) {
   const digits = phone.replace(/\D/g, '')
+  if (!digits) return ''
   if (digits.startsWith('55')) return digits
   return '55' + digits
-}
-
-function isSocketAlive() {
-  try {
-    return sock && sock.ws && sock.ws.readyState === 1
-  } catch {
-    return false
-  }
 }
 
 function scheduleReconnect(delay) {
   if (reconnectTimer) clearTimeout(reconnectTimer)
   reconnectTimer = setTimeout(() => {
-    if (connectionStatus !== 'connected') {
+    if (connectionStatus !== 'connected' && connectionStatus !== 'qr_ready' && connectionStatus !== 'connecting') {
       console.log(`[WhatsApp] Auto-reconnecting in ${delay}ms...`)
       connectWhatsApp()
     }
@@ -120,9 +113,8 @@ async function connectWhatsApp() {
 }
 
 app.get('/api/status', (req, res) => {
-  const alive = isSocketAlive()
   res.json({
-    status: alive ? 'connected' : connectionStatus,
+    status: connectionStatus,
     phone: connectedPhone,
     hasQr: !!qrCode,
   })
@@ -149,12 +141,10 @@ app.post('/api/send', async (req, res) => {
     return res.status(400).json({ success: false, error: 'phone and message required' })
   }
 
-  if (!isSocketAlive()) {
-    console.log(`[WhatsApp] Send blocked: socket not alive. status=${connectionStatus} sock=${!!sock}`)
-    if (connectionStatus !== 'connected') {
-      return res.status(400).json({ success: false, error: 'WhatsApp nao conectado. Escaneie o QR code.' })
-    }
-    return res.status(400).json({ success: false, error: 'WhatsApp desconectou. Reconectando...' })
+  console.log(`[WhatsApp] Send to ${phone}. status=${connectionStatus} sock=${!!sock}`)
+
+  if (!sock || connectionStatus !== 'connected') {
+    return res.status(400).json({ success: false, error: 'WhatsApp nao conectado. Escaneie o QR code.' })
   }
 
   try {
@@ -190,7 +180,7 @@ app.post('/api/send-batch', async (req, res) => {
     return res.status(400).json({ success: false, error: 'messages array required' })
   }
 
-  if (!isSocketAlive()) {
+  if (!sock || connectionStatus !== 'connected') {
     return res.status(400).json({ success: false, error: 'WhatsApp nao conectado' })
   }
 
