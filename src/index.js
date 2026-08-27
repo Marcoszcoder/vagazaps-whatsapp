@@ -6,7 +6,7 @@ const fs = require('fs')
 
 const app = express()
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '1mb' }))
 
 const PORT = process.env.PORT || 3001
 const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_state')
@@ -16,138 +16,127 @@ let qrCode = null
 let connectionStatus = 'disconnected'
 let connectedPhone = null
 let messageQueue = []
-let reconnecting = false
-let connectPromise = null
+let reconnectTimer = null
 
-async function connectWhatsApp() {
-  if (reconnecting) return connectPromise
-  reconnecting = true
-
-  connectPromise = (async () => {
-    try {
-      if (sock) {
-        try { sock.end(undefined, true) } catch {}
-        sock = null
-      }
-
-      if (!fs.existsSync(AUTH_DIR)) {
-        fs.mkdirSync(AUTH_DIR, { recursive: true })
-      }
-
-      const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
-      const { version } = await fetchLatestBaileysVersion()
-
-      connectionStatus = 'connecting'
-      console.log('[WhatsApp] Connecting...')
-
-      sock = makeWASocket({
-        version,
-        auth: state,
-        printQRInTerminal: true,
-        browser: ['VagaZaps', 'Chrome', '4.0'],
-        markOnlineOnConnect: false,
-        connectTimeout: 60000,
-        keepAliveInterval: 30000,
-        generateHighQualityLinkPreview: false,
-      })
-
-      sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update
-
-        if (qr) {
-          qrCode = qr
-          connectionStatus = 'qr_ready'
-          console.log('[WhatsApp] QR Code received')
-        }
-
-        if (connection === 'close') {
-          const statusCode = lastDisconnect?.error?.output?.statusCode
-          console.log(`[WhatsApp] Closed. code=${statusCode}`)
-
-          if (statusCode === DisconnectReason.loggedOut) {
-            connectionStatus = 'logged_out'
-            qrCode = null
-            connectedPhone = null
-            try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }) } catch {}
-          } else if (statusCode === DisconnectReason.connectionClosed ||
-                     statusCode === DisconnectReason.connectionLost ||
-                     statusCode === DisconnectReason.timedOut) {
-            connectionStatus = 'disconnected'
-            qrCode = null
-            reconnecting = false
-            setTimeout(() => connectWhatsApp(), 5000)
-          } else {
-            connectionStatus = 'disconnected'
-            qrCode = null
-            reconnecting = false
-            setTimeout(() => connectWhatsApp(), 10000)
-          }
-        }
-
-        if (connection === 'open') {
-          connectionStatus = 'connected'
-          qrCode = null
-          connectedPhone = sock.user?.id?.replace(/:.*@/, '@').split('@')[0] || null
-          reconnecting = false
-          console.log(`[WhatsApp] Connected! Phone: ${connectedPhone}`)
-        }
-      })
-
-      sock.ev.on('creds.update', saveCreds)
-
-      sock.ev.on('messages.upsert', ({ messages }) => {
-        for (const msg of messages) {
-          if (!msg.key.fromMe && msg.message) {
-            console.log(`[WhatsApp] Msg from ${msg.key.remoteJid}`)
-          }
-        }
-      })
-    } catch (error) {
-      console.error('[WhatsApp] Connect error:', error.message)
-      connectionStatus = 'error'
-      reconnecting = false
-      setTimeout(() => connectWhatsApp(), 10000)
-    }
-  })()
-
-  return connectPromise
+function normalizePhone(phone) {
+  const digits = phone.replace(/\D/g, '')
+  if (digits.startsWith('55')) return digits
+  return '55' + digits
 }
 
-async function ensureConnected() {
-  if (connectionStatus === 'connected' && sock) {
-    return true
+function isSocketAlive() {
+  try {
+    return sock && sock.ws && sock.ws.readyState === 1
+  } catch {
+    return false
   }
-  if (connectionStatus === 'connected' && !sock) {
-    connectionStatus = 'disconnected'
-    reconnecting = false
+}
+
+function scheduleReconnect(delay) {
+  if (reconnectTimer) clearTimeout(reconnectTimer)
+  reconnectTimer = setTimeout(() => {
+    if (connectionStatus !== 'connected') {
+      console.log(`[WhatsApp] Auto-reconnecting in ${delay}ms...`)
+      connectWhatsApp()
+    }
+  }, delay)
+}
+
+async function connectWhatsApp() {
+  try {
+    if (sock) {
+      try { sock.end(undefined, true) } catch {}
+      sock = null
+    }
+
+    if (!fs.existsSync(AUTH_DIR)) {
+      fs.mkdirSync(AUTH_DIR, { recursive: true })
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR)
+    const { version } = await fetchLatestBaileysVersion()
+
+    connectionStatus = 'connecting'
+    console.log('[WhatsApp] Connecting...')
+
+    sock = makeWASocket({
+      version,
+      auth: state,
+      printQRInTerminal: true,
+      browser: ['VagaZaps', 'Chrome', '4.0'],
+      markOnlineOnConnect: false,
+      connectTimeout: 60000,
+      keepAliveInterval: 30000,
+    })
+
+    sock.ev.on('connection.update', (update) => {
+      const { connection, lastDisconnect, qr } = update
+
+      if (qr) {
+        qrCode = qr
+        connectionStatus = 'qr_ready'
+        console.log('[WhatsApp] QR Code received')
+      }
+
+      if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode
+        console.log(`[WhatsApp] Closed. code=${statusCode}`)
+        sock = null
+
+        if (statusCode === DisconnectReason.loggedOut) {
+          connectionStatus = 'logged_out'
+          qrCode = null
+          connectedPhone = null
+          try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }) } catch {}
+        } else {
+          connectionStatus = 'disconnected'
+          qrCode = null
+          scheduleReconnect(5000)
+        }
+      }
+
+      if (connection === 'open') {
+        connectionStatus = 'connected'
+        qrCode = null
+        connectedPhone = sock.user?.id?.replace(/:.*@/, '@').split('@')[0] || null
+        console.log(`[WhatsApp] Connected! Phone: ${connectedPhone}`)
+      }
+    })
+
+    sock.ev.on('creds.update', saveCreds)
+
+    sock.ev.on('messages.upsert', ({ messages }) => {
+      for (const msg of messages) {
+        if (!msg.key.fromMe && msg.message) {
+          console.log(`[WhatsApp] Msg from ${msg.key.remoteJid}`)
+        }
+      }
+    })
+  } catch (error) {
+    console.error('[WhatsApp] Connect error:', error.message)
+    connectionStatus = 'error'
+    scheduleReconnect(10000)
   }
-  if (connectionStatus !== 'connected') {
-    await connectWhatsApp()
-    await new Promise(r => setTimeout(r, 8000))
-    return connectionStatus === 'connected'
-  }
-  return false
 }
 
 app.get('/api/status', (req, res) => {
+  const alive = isSocketAlive()
   res.json({
-    status: connectionStatus,
+    status: alive ? 'connected' : connectionStatus,
     phone: connectedPhone,
     hasQr: !!qrCode,
   })
 })
 
 app.get('/api/qr', (req, res) => {
-  if (!qrCode) {
-    return res.json({ qr: null, status: connectionStatus })
-  }
   res.json({ qr: qrCode, status: connectionStatus })
 })
 
 app.post('/api/connect', async (req, res) => {
   try {
+    if (reconnectTimer) clearTimeout(reconnectTimer)
     await connectWhatsApp()
-    res.json({ success: true, message: 'Connection initiated', status: connectionStatus })
+    res.json({ success: true, status: connectionStatus })
   } catch (error) {
     res.status(500).json({ success: false, error: error.message })
   }
@@ -160,16 +149,16 @@ app.post('/api/send', async (req, res) => {
     return res.status(400).json({ success: false, error: 'phone and message required' })
   }
 
-  console.log(`[WhatsApp] Send request for ${phone}. Status: ${connectionStatus}, sock: ${!!sock}`)
-
-  const connected = await ensureConnected()
-  if (!connected) {
-    console.log(`[WhatsApp] Send failed: not connected after ensureConnected. Status: ${connectionStatus}`)
-    return res.status(400).json({ success: false, error: 'WhatsApp nao conectado. Escaneie o QR code.' })
+  if (!isSocketAlive()) {
+    console.log(`[WhatsApp] Send blocked: socket not alive. status=${connectionStatus} sock=${!!sock}`)
+    if (connectionStatus !== 'connected') {
+      return res.status(400).json({ success: false, error: 'WhatsApp nao conectado. Escaneie o QR code.' })
+    }
+    return res.status(400).json({ success: false, error: 'WhatsApp desconectou. Reconectando...' })
   }
 
   try {
-    const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net'
+    const jid = normalizePhone(phone) + '@s.whatsapp.net'
     console.log(`[WhatsApp] Sending to ${jid}...`)
     const result = await sock.sendMessage(jid, { text: message })
     console.log(`[WhatsApp] Sent! id=${result.key.id}`)
@@ -185,10 +174,9 @@ app.post('/api/send', async (req, res) => {
   } catch (error) {
     console.error('[WhatsApp] Send error:', error.message)
 
-    if (error.message.includes('Connection') || error.message.includes('not open')) {
+    if (error.message.includes('Connection') || error.message.includes('not open') || error.message.includes('closed')) {
       connectionStatus = 'disconnected'
-      reconnecting = false
-      connectWhatsApp()
+      scheduleReconnect(5000)
     }
 
     res.status(500).json({ success: false, error: error.message })
@@ -202,8 +190,7 @@ app.post('/api/send-batch', async (req, res) => {
     return res.status(400).json({ success: false, error: 'messages array required' })
   }
 
-  const connected = await ensureConnected()
-  if (!connected) {
+  if (!isSocketAlive()) {
     return res.status(400).json({ success: false, error: 'WhatsApp nao conectado' })
   }
 
@@ -211,7 +198,7 @@ app.post('/api/send-batch', async (req, res) => {
 
   for (const { phone, message } of messages) {
     try {
-      const jid = phone.replace(/\D/g, '') + '@s.whatsapp.net'
+      const jid = normalizePhone(phone) + '@s.whatsapp.net'
       const result = await sock.sendMessage(jid, { text: message })
       results.push({ phone, success: true, messageId: result.key.id })
       console.log(`[WhatsApp] Batch sent to ${phone}`)
@@ -227,6 +214,7 @@ app.post('/api/send-batch', async (req, res) => {
 
 app.post('/api/disconnect', async (req, res) => {
   try {
+    if (reconnectTimer) clearTimeout(reconnectTimer)
     if (sock) {
       try { sock.end(undefined, true) } catch {}
       sock = null
@@ -234,8 +222,7 @@ app.post('/api/disconnect', async (req, res) => {
     qrCode = null
     connectionStatus = 'disconnected'
     connectedPhone = null
-    reconnecting = false
-    res.json({ success: true, message: 'Disconnected' })
+    res.json({ success: true })
   } catch (error) {
     res.status(500).json({ success: false, error: error.message })
   }
