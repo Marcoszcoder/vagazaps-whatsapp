@@ -226,6 +226,19 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: Math.floor(process.uptime()), status: connectionStatus })
 })
 
+app.get('/api/debug', (req, res) => {
+  let sockInfo = 'null'
+  if (sock) {
+    sockInfo = {
+      hasWs: !!sock.ws,
+      wsReadyState: sock.ws ? sock.ws.readyState : 'no ws',
+      hasUser: !!sock.user,
+      hasSendMessage: typeof sock.sendMessage === 'function',
+    }
+  }
+  res.json({ connectionStatus, connectedPhone, hasSock: !!sock, sockInfo, hasQr: !!qrCode })
+})
+
 connectWhatsApp()
 
 app.listen(PORT, () => {
