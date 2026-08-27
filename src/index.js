@@ -112,6 +112,15 @@ async function connectWhatsApp() {
   }
 }
 
+async function trySend(phone, message) {
+  if (!sock) throw new Error('WhatsApp nao conectado')
+  const jid = normalizePhone(phone) + '@s.whatsapp.net'
+  console.log(`[WhatsApp] Sending to ${jid}...`)
+  const result = await sock.sendMessage(jid, { text: message })
+  console.log(`[WhatsApp] Sent! id=${result.key.id}`)
+  return result
+}
+
 app.get('/api/status', (req, res) => {
   res.json({
     status: connectionStatus,
@@ -122,6 +131,15 @@ app.get('/api/status', (req, res) => {
 
 app.get('/api/qr', (req, res) => {
   res.json({ qr: qrCode, status: connectionStatus })
+})
+
+app.get('/api/debug', (req, res) => {
+  res.json({
+    connectionStatus,
+    connectedPhone,
+    hasSock: !!sock,
+    hasSendMessage: sock ? typeof sock.sendMessage === 'function' : false,
+  })
 })
 
 app.post('/api/connect', async (req, res) => {
@@ -141,17 +159,13 @@ app.post('/api/send', async (req, res) => {
     return res.status(400).json({ success: false, error: 'phone and message required' })
   }
 
-  console.log(`[WhatsApp] Send to ${phone}. status=${connectionStatus} sock=${!!sock}`)
-
-  if (!sock || connectionStatus !== 'connected') {
+  if (!sock) {
+    console.log(`[WhatsApp] Send blocked: no sock`)
     return res.status(400).json({ success: false, error: 'WhatsApp nao conectado. Escaneie o QR code.' })
   }
 
   try {
-    const jid = normalizePhone(phone) + '@s.whatsapp.net'
-    console.log(`[WhatsApp] Sending to ${jid}...`)
-    const result = await sock.sendMessage(jid, { text: message })
-    console.log(`[WhatsApp] Sent! id=${result.key.id}`)
+    const result = await trySend(phone, message)
 
     messageQueue.push({
       to: phone,
@@ -164,7 +178,7 @@ app.post('/api/send', async (req, res) => {
   } catch (error) {
     console.error('[WhatsApp] Send error:', error.message)
 
-    if (error.message.includes('Connection') || error.message.includes('not open') || error.message.includes('closed')) {
+    if (error.message.includes('Connection') || error.message.includes('not open') || error.message.includes('closed') || error.message.includes('nao conectado')) {
       connectionStatus = 'disconnected'
       scheduleReconnect(5000)
     }
@@ -180,7 +194,7 @@ app.post('/api/send-batch', async (req, res) => {
     return res.status(400).json({ success: false, error: 'messages array required' })
   }
 
-  if (!sock || connectionStatus !== 'connected') {
+  if (!sock) {
     return res.status(400).json({ success: false, error: 'WhatsApp nao conectado' })
   }
 
@@ -188,8 +202,7 @@ app.post('/api/send-batch', async (req, res) => {
 
   for (const { phone, message } of messages) {
     try {
-      const jid = normalizePhone(phone) + '@s.whatsapp.net'
-      const result = await sock.sendMessage(jid, { text: message })
+      const result = await trySend(phone, message)
       results.push({ phone, success: true, messageId: result.key.id })
       console.log(`[WhatsApp] Batch sent to ${phone}`)
       await new Promise(resolve => setTimeout(resolve, 2000 + Math.random() * 2000))
@@ -224,19 +237,6 @@ app.get('/api/history', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({ ok: true, uptime: Math.floor(process.uptime()), status: connectionStatus })
-})
-
-app.get('/api/debug', (req, res) => {
-  let sockInfo = 'null'
-  if (sock) {
-    sockInfo = {
-      hasWs: !!sock.ws,
-      wsReadyState: sock.ws ? sock.ws.readyState : 'no ws',
-      hasUser: !!sock.user,
-      hasSendMessage: typeof sock.sendMessage === 'function',
-    }
-  }
-  res.json({ connectionStatus, connectedPhone, hasSock: !!sock, sockInfo, hasQr: !!qrCode })
 })
 
 connectWhatsApp()
